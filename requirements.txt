@@ -6,3 +6,4 @@ torch=2.2.2
 torchvision=0.17.2
 pillow=10.2.0
 d2l=1.0.3
+timm=0.9.7

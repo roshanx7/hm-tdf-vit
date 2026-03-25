@@ -83,19 +83,22 @@ def train(net, train_img_name, train_indicator, train_labels,
     net.to(device)
 
     opt_parameters = [] # Collect parameters to optimize
-    for param in net.IE.base.layerKAN.parameters():
+    
+    # Optionally freeze early TinyViT layers and only train later layers
+    # Freeze all IE parameters initially
+    for param in net.IE.parameters():
+        param.requires_grad = False
+    
+    # Fine-tune only the projection layer and other components
+    for param in net.ie_proj.parameters():
         opt_parameters.append(param)
+        param.requires_grad = True
+    
     for param in net.DE.parameters():
         opt_parameters.append(param)
-    for param in net.FFC.parameters():
+    
+    for param in net.classifier.parameters():
         opt_parameters.append(param)
-    # Freeze layers
-    for param in net.MEC.parameters():
-        param.requires_grad = False
-    for param in net.IE.base.layer1.parameters():
-        param.requires_grad = False
-    for param in net.IE.base.layer2.parameters():
-        param.requires_grad = False
     # Initialize optimizer and scheduler
     optimizer = torch.optim.AdamW(opt_parameters, lr=learning_rate, weight_decay=weight_decay)
     scheduler = lr_scheduler.LambdaLR(optimizer, 
@@ -104,13 +107,28 @@ def train(net, train_img_name, train_indicator, train_labels,
     net.train()
     for epoch in range(num_epochs):        
         print('Epoch: ',epoch, '  Batch Size = ', batch_size, f"  lr = {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Staged fine-tuning: Unfreeze TinyViT layers at checkpoint
+        if epoch == unfreeze_epoch:
+            print(f"\n[STAGED FINE-TUNING] Unfreezing TinyViT layers at epoch {epoch}")
+            net.unfreeze_ie_layers(unfreeze_ratio=0.5)  # Unfreeze last 50% of layers
+            # Recreate optimizer to include unfrozen parameters
+            opt_parameters = []
+            for param in net.parameters():
+                if param.requires_grad:
+                    opt_parameters.append(param)
+            optimizer = torch.optim.AdamW(opt_parameters, lr=learning_rate * 0.1, weight_decay=weight_decay)
+            scheduler = lr_scheduler.LambdaLR(optimizer, 
+                                            lr_lambda=lambda ep: adjust_learning_rate(ep - epoch, warmup_factor, warmup_epochs))
+            print(f"[INFO] Recreated optimizer with reduced learning rate (0.1x)")
+        
         train_ls_batch = []
         optimizer.zero_grad()
         i = 0
         for img_tensor, feature_tensor, labels, _ in data_iter(True, img_dir, train_img_name, train_indicator, train_labels,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels.to(device)
-            logits, _, _, _ = net(X, Xf)
+            logits = net(X, Xf)
 
             cls_loss = moi_loss(logits, y)
             reg_loss = net.regularization_loss(reg_loss_rate_active, reg_loss_rate_entropy)
@@ -138,7 +156,7 @@ def train(net, train_img_name, train_indicator, train_labels,
         for img_tensor, feature_tensor, labels, batch_index in data_iter(False, img_dir, train_img_name, train_indicator, train_labels,
                                                                             images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels
-            logits, _, _, _ = net(X, Xf)
+            logits = net(X, Xf)
             logit_hub.append(logits.detach().to('cpu'))
             index_hub.extend(batch_index) 
             label_hub.append(labels) 
@@ -169,17 +187,20 @@ def train(net, train_img_name, train_indicator, train_labels,
     hard_train_labels = train_labels[hard_index]
 
 
-    for param in net.MEC.parameters():
+    # For hard mining phase with new architecture: fine-tune the classifier
+    for param in net.classifier.parameters():
+        param.requires_grad = True
+    for param in net.ie_proj.parameters():
         param.requires_grad = True
     for param in net.IE.parameters():
         param.requires_grad = False
     for param in net.DE.parameters():
         param.requires_grad = False
-    for param in net.FFC.parameters():
-        param.requires_grad = False
 
     hard_opt_parameters = [] # Collect parameters to optimize
-    for param in net.MEC.parameters():
+    for param in net.classifier.parameters():
+        hard_opt_parameters.append(param)
+    for param in net.ie_proj.parameters():
         hard_opt_parameters.append(param)
     
     net.to('cpu')
@@ -202,9 +223,10 @@ def train(net, train_img_name, train_indicator, train_labels,
         for img_tensor, feature_tensor, labels, _ in data_iter(True, img_dir, hard_train_img_name, hard_train_features, hard_train_labels,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels.to(device)
-            _, _, distance, _ = net(X, Xf)
+            logits = net(X, Xf)
 
-            cls_loss = (distance * y).mean()
+            # Use cross-entropy loss for hard mining training
+            cls_loss = torch.nn.functional.cross_entropy(logits, y.argmax(dim=1))
             reg_loss = net.regularization_loss(reg_loss_rate_active, reg_loss_rate_entropy)
             l = cls_loss + reg_loss
             train_ls_batch.append(cls_loss.item())
@@ -232,8 +254,8 @@ def train(net, train_img_name, train_indicator, train_labels,
             for img_tensor, feature_tensor, labels, _ in data_iter(False, img_dir, valid_img_name, valid_indicator, valid_labels,
                                                                     images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
                 X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels
-                FCC_out, MEC_out, distance, _ = net(X, Xf)
-                cls_loss = (distance * y.to(device)).mean() # MEC loss
+                logits = net(X, Xf)
+                cls_loss = torch.nn.functional.cross_entropy(logits, y.to(device).argmax(dim=1))
                 reg_loss = net.regularization_loss(reg_loss_rate_active, reg_loss_rate_entropy)
                 l = cls_loss + reg_loss      
                 valid_ls_batch.append(cls_loss.item())       
@@ -277,16 +299,10 @@ def train(net, train_img_name, train_indicator, train_labels,
         for img_tensor, feature_tensor, labels, _ in data_iter(False, img_dir, valid_img_name, valid_indicator, valid_labels,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels
-            FCC_out, MEC_out, distance, _ = net(X, Xf)
+            logits = net(X, Xf)
 
-            uncertainty_tensor = moi_uncertianty(FCC_out)
-            hard_index_val = torch.where(uncertainty_tensor > uncertainty_threshold)[0]
-            hard_num = hard_index_val.size(0)
-            if hard_num:
-                hard_num_total += hard_num
-                FCC_out[hard_index_val] = MEC_out[hard_index_val]
-
-            y_hat = FCC_out.detach().to('cpu')
+            # Just use logits directly (no MEC-based switching)
+            y_hat = logits.detach().to('cpu')
             samples_num -= images_per_gpu
             if samples_num < 0:
                 last_num = images_per_gpu + samples_num
@@ -444,10 +460,14 @@ if __name__ == "__main__":
     warmup_epochs, warmup_factor = 5, 0.01
     save_interval = int(num_epochs/10) if int(num_epochs/10) else 1 # num_epochs/10
 
-    image_shape = (448, 448) # (224, 224)
+    # CRITICAL: TinyViT expects 224x224 input (was 448x448)
+    image_shape = (224, 224)  # Changed from (448, 448) for TinyViT compatibility
     rgb_mean = torch.tensor([123.675, 116.28, 103.53])/255 # COCO dataset
     rgb_std = torch.tensor([58.395, 57.12, 57.375])/255
     pad_val = [0, 0, 0] # images masked with dark
+    
+    # Staged fine-tuning: unfreeze TinyViT layers after this epoch
+    unfreeze_epoch = num_epochs // 2  # Unfreeze at midpoint (e.g., epoch 25 for 50 epochs)
 
     if not os.path.exists(work_dir):
         os.makedirs(work_dir)
